@@ -244,6 +244,21 @@ inline static void * ggml_aligned_malloc(size_t size) {
 #endif
 #endif
 
+inline static void balance211(int64_t n, int64_t nth, int64_t ith, int64_t * n_start, int64_t * n_end) {
+    int64_t * n_my = n_end;
+    if (nth <= 1 || n == 0) {
+        n_start[0] = 0;
+        n_my[0] = n;
+    } else {
+        int64_t n1 = (n + nth - 1)/nth;
+        int64_t n2 = n1 - 1;
+        int64_t T1 = n - n2*nth;
+        n_my[0] = ith < T1 ? n1 : n2;
+        n_start[0] = ith <= T1 ? ith*n1 : T1*n1 + (ith - T1)*n2;
+    }
+    n_end[0] += n_start[0];
+}
+
 inline static void * ggml_malloc(size_t size) {
     if (size == 0) {
         GGML_PRINT("WARNING: Behavior may be unexpected when allocating 0 bytes for ggml_malloc!\n");
@@ -10905,29 +10920,25 @@ UseGgmlGemm2:;
     const int64_t ith0 = ith % nth0;
     const int64_t ith1 = ith / nth0;
 
-    const int64_t dr0 = (nr0 + nth0 - 1)/nth0;
-    const int64_t dr1 = (nr1 + nth1 - 1)/nth1;
+    // block-tiling attempt
+    const int64_t blck_0 = 16;
+    const int64_t blck_1 = 16;
 
-    const int64_t ir010 = dr0*ith0;
-    const int64_t ir011 = MIN(ir010 + dr0, nr0);
+    const int64_t nblck0 = (nr0 + blck_0 - 1)/blck_0;
+    const int64_t nblck1 = (nr1 + blck_1 - 1)/blck_1;
 
-    const int64_t ir110 = dr1*ith1;
-    const int64_t ir111 = MIN(ir110 + dr1, nr1);
-
-    //printf("ir010 = %6lld, ir011 = %6lld, ir110 = %6lld, ir111 = %6lld\n", ir010, ir011, ir110, ir111);
+    int64_t ib010, ib011, ib110, ib111;
+    balance211(nblck0, nth0, ith0, &ib010, &ib011);
+    balance211(nblck1, nth1, ith1, &ib110, &ib111);
 
     // threads with no work simply yield (not sure if it helps)
-    if (ir010 >= ir011 || ir110 >= ir111) {
+    if (ib010 >= ib011 || ib110 >= ib111) {
         sched_yield();
         return;
     }
 
     assert(ne12 % ne02 == 0);
     assert(ne13 % ne03 == 0);
-
-    // block-tiling attempt
-    const int64_t blck_0 = 16;
-    const int64_t blck_1 = 16;
 
     // dot kernels can handle 1 row and col at a time, but mmla kernels can process 2 rows and cols
     int64_t nrc = vec_dot_num_rows;
@@ -10943,9 +10954,18 @@ UseGgmlGemm2:;
     // 16 * 2, accounting for mmla kernels
     float tmp[32];
 
-    for (int64_t iir1 = ir110; iir1 < ir111; iir1 += blck_1) {
-        for (int64_t iir0 = ir010; iir0 < ir011; iir0 += blck_0) {
-            for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir111; ir1 += nrc) {
+    // strides for vec_dot
+    const size_t bs = nrc>1 ? 16 : 0;
+    const size_t bx = nrc>1 ? nb01 : 0;
+    const size_t by = nrc>1 ? src1_col_stride : 0;
+
+    for (int64_t ib1 = ib110; ib1 < ib111; ib1++) {
+        for (int64_t ib0 = ib010; ib0 < ib011; ib0++) {
+            const int64_t ir00 = ib0 * blck_0;
+            const int64_t ir01 = MIN(ir00 + blck_0, nr0);
+            const int64_t ir10 = ib1 * blck_1;
+            const int64_t ir11 = MIN(ir10 + blck_1, nr1);
+            for (int64_t ir1 = ir10; ir1 < ir11; ir1 += nrc) {
                 const int64_t i13 = (ir1/(ne12*ne1));
                 const int64_t i12 = (ir1 - i13*ne12*ne1)/ne1;
                 const int64_t i11 = (ir1 - i13*ne12*ne1 - i12*ne1);
@@ -10970,16 +10990,12 @@ UseGgmlGemm2:;
                      : (i11*nb11 + i12*nb12 + i13*nb13));
                 float * dst_col = (float *) ((char *) dst->data + (i1*nb1 + i2*nb2 + i3*nb3));
 
-                //for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir011; ++ir0) {
-                //    vec_dot(ne00, &dst_col[ir0], src0_row + ir0*nb01, src1_col);
-                //}
-
-                for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir011; ir0 += nrc) {
-                    vec_dot(ne00, &tmp[ir0 - iir0], (nrc>1 ? 16 : 0), src0_row + ir0*nb01, (nrc>1 ? nb01 : 0), src1_col, (nrc>1 ? src1_col_stride : 0), nrc);
+                for (int64_t ir0 = ir00; ir0 < ir01; ir0 += nrc) {
+                    vec_dot(ne00, &tmp[ir0 - ir00], bs, src0_row + ir0*nb01, bx, src1_col, by, nrc);
                 }
 
                 for (int cn = 0; cn < nrc; ++cn) {
-                    memcpy(&dst_col[iir0 + cn*nb1/nb0], tmp + (cn*16), (MIN(iir0 + blck_0, ir011) - iir0)*sizeof(float));
+                    memcpy(&dst_col[ir00 + cn*nb1/nb0], tmp + (cn*16), (ir01 - ir00)*sizeof(float));
                 }
             }
         }
