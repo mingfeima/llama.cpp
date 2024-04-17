@@ -312,6 +312,13 @@
     GGML_TENSOR_LOCALS(int64_t, ne,  dst,  ne) \
     GGML_TENSOR_LOCALS(size_t,  nb,  dst,  nb)
 
+// block size for mulmat
+#if defined(__AMX_INT8__)
+#define GGML_MUL_MAT_BLCK_SIZE    32
+#else
+#define GGML_MUL_MAT_BLCK_SIZE    16
+#endif
+
 #ifdef  __cplusplus
 extern "C" {
 #endif

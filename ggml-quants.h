@@ -127,6 +127,16 @@ void iq2xs_free_impl(enum ggml_type type);
 void iq3xs_init_impl(int grid_size);
 void iq3xs_free_impl(int grid_size);
 
+#if defined(__AMX_INT8__)
+
+#define TILE_M 16
+#define TILE_N 16
+#define TILE_K 32
+#define VNNI_BLK 4
+
+void ggml_tile_config_init(void);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

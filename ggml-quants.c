@@ -13,6 +13,7 @@
 #include <float.h>
 #include <stdlib.h> // for qsort
 #include <stdio.h>  // for GGML_ASSERT
+#include <threads.h> // for thread_local
 
 #ifdef __ARM_NEON
 
@@ -3681,6 +3682,191 @@ static inline __m128i get_scale_shuffle(int i) {
 }
 #endif
 
+#if defined(__AMX_INT8__)
+
+#define TMM0 0
+#define TMM1 1
+#define TMM2 2
+#define TMM3 3
+#define TMM4 4
+#define TMM5 5
+#define TMM6 6
+#define TMM7 7
+
+// define tile config data structure
+typedef struct {
+    uint8_t palette_id;
+    uint8_t start_row;
+    uint8_t reserved_0[14];
+    uint16_t colsb[16];
+    uint8_t rows[16];
+} tile_config_t;
+
+void ggml_tile_config_init(void) {
+    // TODO: try remove _tile_storeconfig ??
+    static thread_local tile_config_t tc = {0};
+    tile_config_t current_tc = {0};
+    _tile_storeconfig(&current_tc);
+
+    // load only when config changes
+    if (tc.palette_id == 0 || (memcmp(&current_tc.colsb, &tc.colsb, sizeof(uint16_t) * 8) != 0 &&
+                               memcmp(&current_tc.rows, &tc.rows, sizeof(uint8_t) * 8) != 0)) {
+        tc.palette_id = 1;
+        tc.start_row = 0;
+        // TODO: add notes
+        #define TC_CONFIG_TILE(i, r, cb) tc.rows[i] = r; tc.colsb[i] = cb
+        TC_CONFIG_TILE(TMM0, 8, 64);
+        TC_CONFIG_TILE(TMM1, 8, 64);
+        TC_CONFIG_TILE(TMM2, 16, 32);
+        TC_CONFIG_TILE(TMM3, 16, 32);
+        TC_CONFIG_TILE(TMM4, 16, 64);
+        TC_CONFIG_TILE(TMM5, 16, 64);
+        TC_CONFIG_TILE(TMM6, 16, 64);
+        TC_CONFIG_TILE(TMM7, 16, 64);
+        _tile_loadconfig(&tc);
+    }
+}
+
+static inline void init_T(int32_t * tile, int nr) {
+    __m512i zero = _mm512_set1_epi32(0);
+    int i = 0;
+    for (; i < nr; i += 4) {
+        _mm512_storeu_si512(tile + (i    )*TILE_N, zero);
+        _mm512_storeu_si512(tile + (i + 1)*TILE_N, zero);
+        _mm512_storeu_si512(tile + (i + 2)*TILE_N, zero);
+        _mm512_storeu_si512(tile + (i + 3)*TILE_N, zero);
+    }
+    for (; i < nr; ++i) {
+        _mm512_storeu_si512(tile + i*TILE_N, zero);
+    }
+}
+
+static inline void init_C(float * s, size_t bs, int nr) {
+    __m512 zero = _mm512_set1_ps(0.f);
+    for (int i = 0; i < nr; ++i) {
+        _mm512_storeu_ps(s + i*bs, zero);
+        _mm512_storeu_ps(s + i*bs + 16, zero);
+    }
+}
+
+static inline void transpose_8x8_32bit(__m256i * v, __m256i * v1) {
+    // unpacking and 32-bit elements
+    v1[0] = _mm256_unpacklo_epi32(v[0], v[1]);
+    v1[1] = _mm256_unpackhi_epi32(v[0], v[1]);
+    v1[2] = _mm256_unpacklo_epi32(v[2], v[3]);
+    v1[3] = _mm256_unpackhi_epi32(v[2], v[3]);
+    v1[4] = _mm256_unpacklo_epi32(v[4], v[5]);
+    v1[5] = _mm256_unpackhi_epi32(v[4], v[5]);
+    v1[6] = _mm256_unpacklo_epi32(v[6], v[7]);
+    v1[7] = _mm256_unpackhi_epi32(v[6], v[7]);
+
+    // shuffling the 32-bit elements
+    #define SHUFFLE_EPI32(a, b, mask) \
+        _mm256_castps_si256(_mm256_shuffle_ps(_mm256_castsi256_ps(a), _mm256_castsi256_ps(b), mask))
+    v[0] = SHUFFLE_EPI32(v1[0], v1[2], 0x44);
+    v[1] = SHUFFLE_EPI32(v1[0], v1[2], 0xee);
+    v[2] = SHUFFLE_EPI32(v1[4], v1[6], 0x44);
+    v[3] = SHUFFLE_EPI32(v1[4], v1[6], 0xee);
+    v[4] = SHUFFLE_EPI32(v1[1], v1[3], 0x44);
+    v[5] = SHUFFLE_EPI32(v1[1], v1[3], 0xee);
+    v[6] = SHUFFLE_EPI32(v1[5], v1[7], 0x44);
+    v[7] = SHUFFLE_EPI32(v1[5], v1[7], 0xee);
+
+    // shuffling 128-bit elements
+    v1[0] = _mm256_permute2f128_si256(v[2], v[0], 0x02);
+    v1[1] = _mm256_permute2f128_si256(v[3], v[1], 0x02);
+    v1[2] = _mm256_permute2f128_si256(v[6], v[4], 0x02);
+    v1[3] = _mm256_permute2f128_si256(v[7], v[5], 0x02);
+    v1[4] = _mm256_permute2f128_si256(v[2], v[0], 0x13);
+    v1[5] = _mm256_permute2f128_si256(v[3], v[1], 0x13);
+    v1[6] = _mm256_permute2f128_si256(v[6], v[4], 0x13);
+    v1[7] = _mm256_permute2f128_si256(v[7], v[5], 0x13);
+}
+
+// from {16, 32/2} int4 {n, k}
+//   to { 8, 64/2} int8 {k/4, n, 4}, viewed as {k/4, n4}
+static inline void unpack_B(int8_t * restrict tile, const uint8_t * restrict b, size_t bx) {
+    const __m256i off = _mm256_set1_epi8(8);
+    __m256i v[8], v2[8];
+    for (int n = 0; n < 8; ++n) {
+        v[n] = _mm256_sub_epi8(bytes_from_nibbles_32(b + n*bx), off);
+    }
+    transpose_8x8_32bit(v, v2);
+    for (int n = 0; n < 8; ++n) {
+        _mm256_storeu_si256((__m256i *)(tile + n*64), v2[n]);
+    }
+    for (int n = 0; n < 8; ++n) {
+        v[n] = _mm256_sub_epi8(bytes_from_nibbles_32(b + (n + 8)*bx), off);
+    }
+    transpose_8x8_32bit(v, v2);
+    for (int n = 0; n < 8; ++n) {
+        _mm256_storeu_si256((__m256i *)(tile + n*64 + 32), v2[n]);
+    }
+}
+
+static inline void unpack_B1(uint8_t * restrict tile, const uint8_t * restrict b, size_t bx) {
+    __m256i v[8], v2[8];
+    for (int n = 0; n < 8; ++n) {
+        v[n] = bytes_from_nibbles_32(b + n*bx);
+    }
+    transpose_8x8_32bit(v, v2);
+    for (int n = 0; n < 8; ++n) {
+        _mm256_storeu_si256((__m256i *)(tile + n*64), v2[n]);
+    }
+    for (int n = 0; n < 8; ++n) {
+        v[n] = bytes_from_nibbles_32(b + (n + 8)*bx);
+    }
+    transpose_8x8_32bit(v, v2);
+    for (int n = 0; n < 8; ++n) {
+        _mm256_storeu_si256((__m256i *)(tile + n*64 + 32), v2[n]);
+    }
+}
+
+static inline void acc_C(float* restrict s, size_t bs, const int32_t * restrict tile, const ggml_half * d0, size_t bx, const ggml_half * d1, size_t by, int nr) {
+    const size_t stride_d0 = bx / sizeof(ggml_half);
+    const size_t stride_d1 = by / sizeof(ggml_half);
+
+    ggml_half tmp[TILE_N];
+    for (int n = 0; n < TILE_N; ++n) {
+        tmp[n] = d0[n*stride_d0];
+    }
+    const __m512 vd0 = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)tmp));
+
+    for (int m = 0; m < nr; ++m) {
+        const __m512 vd1 = _mm512_set1_ps(GGML_FP16_TO_FP32(d1[m*stride_d1]));
+        const __m512 vtile = _mm512_cvtepi32_ps(_mm512_loadu_si512(tile + m*TILE_N));
+
+        __m512 vsum = _mm512_loadu_ps(s + m*bs);
+        vsum = _mm512_fmadd_ps(vtile, _mm512_mul_ps(vd0, vd1), vsum);
+        _mm512_storeu_ps(s + m*bs, vsum);
+    }
+}
+
+static inline void acc_C1(float* restrict s, size_t bs, const int32_t * restrict tile, const ggml_half * d0, const ggml_half * m0, size_t bx, const ggml_half * d1, const ggml_half * s1, size_t by, int nr) {
+    const size_t stride_d0 = bx / sizeof(ggml_half);
+    const size_t stride_d1 = by / sizeof(ggml_half);
+
+    ggml_half tmp[TILE_N], tmp2[TILE_N];
+    for (int n = 0; n < TILE_N; ++n) {
+        tmp[n] = d0[n*stride_d0];
+        tmp2[n] = m0[n*stride_d0];
+    }
+    const __m512 vd0 = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)tmp));
+    const __m512 vm0 = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)tmp2));
+
+    for (int m = 0; m < nr; ++m) {
+        const __m512 vd1 = _mm512_set1_ps(GGML_FP16_TO_FP32(d1[m*stride_d1]));
+        const __m512 vs1 = _mm512_set1_ps(GGML_FP16_TO_FP32(s1[m*stride_d1]));
+        const __m512 vtile = _mm512_cvtepi32_ps(_mm512_loadu_si512(tile + m*TILE_N));
+
+        __m512 vsum = _mm512_loadu_ps(s + m*bs);
+        vsum = _mm512_fmadd_ps(vtile, _mm512_mul_ps(vd0, vd1), vsum);
+        vsum = _mm512_fmadd_ps(vm0, vs1, vsum);
+        _mm512_storeu_ps(s + m*bs, vsum);
+    }
+}
+#endif
+
 void ggml_vec_dot_q4_0_q8_0(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
     const int qk = QK8_0;
     const int nb = n / qk;
@@ -3688,6 +3874,8 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * restrict s, size_t bs, const void * r
     assert(n % qk == 0);
 #if defined(__ARM_FEATURE_MATMUL_INT8)
     assert((nrc == 2) || (nrc == 1));
+#elif defined(__AMX_INT8__)
+    assert (nrc <= GGML_MUL_MAT_BLCK_SIZE);
 #else
     assert(nrc == 1);
 #endif
@@ -3767,6 +3955,97 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * restrict s, size_t bs, const void * r
         return;
     }
 #endif
+#if defined(__AMX_INT8__)
+    assert(nrc <= 2*TILE_M && qk == TILE_K);
+    if (bs != 0) {
+        const int nrows = nrc;
+        //const int ncols = GGML_MUL_MAT_BLCK_SIZE;
+
+        const int nr0 = MIN(nrows, TILE_M);
+        const int nr1 = MAX(nrows - TILE_M, 0);
+
+        int8_t Tile0[TILE_N * TILE_K];
+        int8_t Tile1[TILE_N * TILE_K];
+
+        int32_t Tile4[TILE_M * TILE_N];
+        int32_t Tile5[TILE_M * TILE_N];
+        int32_t Tile6[TILE_M * TILE_N];
+        int32_t Tile7[TILE_M * TILE_N];
+
+        int32_t Tzero[TILE_M * TILE_N];
+        init_T(Tzero, nr1 == 0 ? nr0 : TILE_M);
+        init_C(s, bs, nrows);
+
+        if (nrows == 2*TILE_M) {
+            for (int i = 0; i < nb; ++i) {
+                _tile_loadd(TMM4, Tzero, TILE_N * sizeof(int32_t));
+                _tile_loadd(TMM5, Tzero, TILE_N * sizeof(int32_t));
+                _tile_loadd(TMM6, Tzero, TILE_N * sizeof(int32_t));
+                _tile_loadd(TMM7, Tzero, TILE_N * sizeof(int32_t));
+
+                unpack_B(Tile0, x[i].qs, bx);
+                _tile_loadd(TMM0, Tile0, TILE_N * VNNI_BLK);
+
+                unpack_B(Tile1, x[TILE_N * nb + i].qs, bx);
+                _tile_loadd(TMM1, Tile1, TILE_N * VNNI_BLK);
+
+                _tile_loadd(TMM2, y[i].qs, by);
+                _tile_loadd(TMM3, y[TILE_M * nb + i].qs, by);
+
+                _tile_dpbssd(TMM4, TMM2, TMM0);
+                _tile_dpbssd(TMM5, TMM3, TMM0);
+                _tile_dpbssd(TMM6, TMM2, TMM1);
+                _tile_dpbssd(TMM7, TMM3, TMM1);
+
+                _tile_stored(TMM4, Tile4, TILE_N * sizeof(int32_t));
+                _tile_stored(TMM5, Tile5, TILE_N * sizeof(int32_t));
+                _tile_stored(TMM6, Tile6, TILE_N * sizeof(int32_t));
+                _tile_stored(TMM7, Tile7, TILE_N * sizeof(int32_t));
+
+                acc_C(s,                        bs, Tile4, &x[i].d,               bx, &y[i].d,               by, TILE_M);
+                acc_C(s + TILE_M * bs,          bs, Tile5, &x[i].d,               bx, &y[TILE_M * nb + i].d, by, TILE_M);
+                acc_C(s + TILE_N,               bs, Tile6, &x[TILE_N * nb + i].d, bx, &y[i].d,               by, TILE_M);
+                acc_C(s + TILE_M * bs + TILE_N, bs, Tile7, &x[TILE_N * nb + i].d, bx, &y[TILE_M * nb + i].d, by, TILE_M);
+            }
+        } else {
+            for (int i = 0; i < nb; ++i) {
+                _tile_loadd(TMM4, Tzero, TILE_N * sizeof(int32_t));
+                _tile_loadd(TMM6, Tzero, TILE_N * sizeof(int32_t));
+                if (nr1 != 0) {
+                    _tile_loadd(TMM5, Tzero, TILE_N * sizeof(int32_t));
+                    _tile_loadd(TMM7, Tzero, TILE_N * sizeof(int32_t));
+                }
+
+                unpack_B(Tile0, x[i].qs, bx);
+                _tile_loadd(TMM0, Tile0, TILE_N * VNNI_BLK);
+
+                unpack_B(Tile1, x[TILE_N * nb + i].qs, bx);
+                _tile_loadd(TMM1, Tile1, TILE_N * VNNI_BLK);
+
+                _tile_loadd(TMM2, y[i].qs, by);
+
+                _tile_dpbssd(TMM4, TMM2, TMM0);
+                _tile_dpbssd(TMM6, TMM2, TMM1);
+
+                _tile_stored(TMM4, Tile4, TILE_N * sizeof(int32_t));
+                _tile_stored(TMM6, Tile6, TILE_N * sizeof(int32_t));
+
+                acc_C(s,          bs, Tile4, &x[i].d,               bx, &y[i].d, by, nr0);
+                acc_C(s + TILE_N, bs, Tile6, &x[TILE_N * nb + i].d, bx, &y[i].d, by, nr0);
+                if (nr1 != 0) {
+                    _tile_loadd(TMM3, y[TILE_M * nb + i].qs, by);
+                    _tile_dpbssd(TMM5, TMM3, TMM0);
+                    _tile_dpbssd(TMM7, TMM3, TMM1);
+                    _tile_stored(TMM5, Tile5, TILE_N * sizeof(int32_t));
+                    _tile_stored(TMM7, Tile7, TILE_N * sizeof(int32_t));
+                    acc_C(s + TILE_M * bs,          bs, Tile5, &x[i].d,               bx, &y[TILE_M * nb + i].d, by, nr1);
+                    acc_C(s + TILE_M * bs + TILE_N, bs, Tile7, &x[TILE_N * nb + i].d, bx, &y[TILE_M * nb + i].d, by, nr1);
+                }
+            }
+        }
+        return;
+    }
+#endif // __AMX_INT8__
 #if defined(__ARM_NEON)
     float32x4_t sumv0 = vdupq_n_f32(0.0f);
     float32x4_t sumv1 = vdupq_n_f32(0.0f);
@@ -4055,6 +4334,8 @@ void ggml_vec_dot_q4_1_q8_1(int n, float * restrict s, size_t bs, const void * r
     assert(n % qk == 0);
 #if defined(__ARM_FEATURE_MATMUL_INT8)
     assert((nrc == 2) || (nrc == 1));
+#elif defined(__AMX_INT8__)
+    assert (nrc <= GGML_MUL_MAT_BLCK_SIZE);
 #else
     assert(nrc == 1);
 #endif
@@ -4065,7 +4346,98 @@ void ggml_vec_dot_q4_1_q8_1(int n, float * restrict s, size_t bs, const void * r
 
     const block_q4_1 * restrict x = vx;
     const block_q8_1 * restrict y = vy;
+#if defined(__AMX_INT8__)
+    assert(nrc <= 2*TILE_M && qk == TILE_K);
+    if (bs != 0) {
+        const int nrows = nrc;
+        //const int ncols = GGML_MUL_MAT_BLCK_SIZE;
 
+        const int nr0 = MIN(nrows, TILE_M);
+        const int nr1 = MAX(nrows - TILE_M, 0);
+
+        uint8_t Tile0[TILE_N * TILE_K];
+        uint8_t Tile1[TILE_N * TILE_K];
+
+        int32_t Tile4[TILE_M * TILE_N];
+        int32_t Tile5[TILE_M * TILE_N];
+        int32_t Tile6[TILE_M * TILE_N];
+        int32_t Tile7[TILE_M * TILE_N];
+
+        int32_t Tzero[TILE_M * TILE_N];
+        init_T(Tzero, nr1 == 0 ? nr0 : TILE_M);
+        init_C(s, bs, nrows);
+
+        if (nrows == 2*TILE_M) {
+            for (int i = 0; i < nb; ++i) {
+                _tile_loadd(TMM4, Tzero, TILE_N * sizeof(int32_t));
+
+                unpack_B1(Tile0, x[i].qs, bx);
+                _tile_loadd(TMM0, Tile0, TILE_N * VNNI_BLK);
+
+                _tile_loadd(TMM2, y[i].qs, by);
+                _tile_dpbsud(TMM4, TMM2, TMM0);
+                _tile_stored(TMM4, Tile4, TILE_N * sizeof(int32_t));
+
+                _tile_loadd(TMM6, Tzero, TILE_N * sizeof(int32_t));
+                unpack_B1(Tile1, x[TILE_N * nb + i].qs, bx);
+                _tile_loadd(TMM5, Tzero, TILE_N * sizeof(int32_t));
+                _tile_loadd(TMM1, Tile1, TILE_N * VNNI_BLK);
+                acc_C1(s, bs, Tile4, &x[i].d, &x[i].m, bx, &y[i].d, &y[i].s, by, TILE_M);
+
+                _tile_dpbsud(TMM6, TMM2, TMM1);
+                _tile_stored(TMM6, Tile6, TILE_N * sizeof(int32_t));
+
+
+                _tile_loadd(TMM7, Tzero, TILE_N * sizeof(int32_t));
+                _tile_loadd(TMM3, y[TILE_M * nb + i].qs, by);
+                acc_C1(s + TILE_N, bs, Tile6, &x[TILE_N * nb + i].d, &x[TILE_N * nb + i].m, bx, &y[i].d, &y[i].s, by, TILE_M);
+                _tile_dpbsud(TMM5, TMM3, TMM0);
+                _tile_stored(TMM5, Tile5, TILE_N * sizeof(int32_t));
+
+                _tile_dpbsud(TMM7, TMM3, TMM1);
+                acc_C1(s + TILE_M * bs, bs, Tile5, &x[i].d, &x[i].m, bx, &y[TILE_M * nb + i].d, &y[TILE_M * nb + i].s, by, TILE_M);
+                _tile_stored(TMM7, Tile7, TILE_N * sizeof(int32_t));
+                acc_C1(s + TILE_M * bs + TILE_N, bs, Tile7, &x[TILE_N * nb + i].d, &x[TILE_N * nb + i].m, bx, &y[TILE_M * nb + i].d, &y[TILE_M * nb + i].s, by, TILE_M);
+            }
+        } else {
+            for (int i = 0; i < nb; ++i) {
+                _tile_loadd(TMM4, Tzero, TILE_N * sizeof(int32_t));
+                _tile_loadd(TMM6, Tzero, TILE_N * sizeof(int32_t));
+                if (nr1 != 0) {
+                    _tile_loadd(TMM5, Tzero, TILE_N * sizeof(int32_t));
+                    _tile_loadd(TMM7, Tzero, TILE_N * sizeof(int32_t));
+                }
+
+                unpack_B1(Tile0, x[i].qs, bx);
+                _tile_loadd(TMM0, Tile0, TILE_N * VNNI_BLK);
+
+                unpack_B1(Tile1, x[TILE_N * nb + i].qs, bx);
+                _tile_loadd(TMM1, Tile1, TILE_N * VNNI_BLK);
+
+                _tile_loadd(TMM2, y[i].qs, by);
+
+                _tile_dpbsud(TMM4, TMM2, TMM0);
+                _tile_dpbsud(TMM6, TMM2, TMM1);
+
+                _tile_stored(TMM4, Tile4, TILE_N * sizeof(int32_t));
+                _tile_stored(TMM6, Tile6, TILE_N * sizeof(int32_t));
+
+                acc_C1(s,          bs, Tile4, &x[i].d,               &x[i].m,               bx, &y[i].d, &y[i].s, by, nr0);
+                acc_C1(s + TILE_N, bs, Tile6, &x[TILE_N * nb + i].d, &x[TILE_N * nb + i].m, bx, &y[i].d, &y[i].s, by, nr0);
+                if (nr1 != 0) {
+                    _tile_loadd(TMM3, y[TILE_M * nb + i].qs, by);
+                    _tile_dpbsud(TMM5, TMM3, TMM0);
+                    _tile_dpbsud(TMM7, TMM3, TMM1);
+                    _tile_stored(TMM5, Tile5, TILE_N * sizeof(int32_t));
+                    _tile_stored(TMM7, Tile7, TILE_N * sizeof(int32_t));
+                    acc_C1(s + TILE_M * bs,          bs, Tile5, &x[i].d,               &x[i].m,               bx, &y[TILE_M * nb + i].d, &y[TILE_M * nb + i].s, by, nr1);
+                    acc_C1(s + TILE_M * bs + TILE_N, bs, Tile7, &x[TILE_N * nb + i].d, &x[TILE_N * nb + i].m, bx, &y[TILE_M * nb + i].d, &y[TILE_M * nb + i].s, by, nr1);
+                }
+            }
+        }
+        return;
+    }
+#endif // __AMX_INT8__
 #if defined(__ARM_FEATURE_MATMUL_INT8)
     if (nrc == 2) {
         const block_q4_1 * restrict vx0 = vx;

@@ -584,6 +584,8 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_0,
 #if defined (__ARM_FEATURE_MATMUL_INT8)
         .nrows                    = 2,
+#elif defined (__AMX_INT8__)
+        .nrows                    = 32,
 #else
         .nrows                    = 1,
 #endif
@@ -600,6 +602,8 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_1,
 #if defined (__ARM_FEATURE_MATMUL_INT8)
         .nrows                    = 2,
+#elif defined (__AMX_INT8__)
+        .nrows                    = 32,
 #else
         .nrows                    = 1,
 #endif
@@ -2394,6 +2398,32 @@ bool ggml_is_numa(void) {
     return g_state.numa.n_nodes > 1;
 }
 
+#if defined(__AMX_INT8__)
+
+// global flag for amx init
+static bool ggml_amx_initialized = false;
+
+#define ARCH_GET_XCOMP_PERM     0x1022
+#define ARCH_REQ_XCOMP_PERM     0x1023
+#define XFEATURE_XTILECFG       17
+#define XFEATURE_XTILEDATA      18
+
+static void ggml_amx_init(void) {
+    if (ggml_amx_initialized) {
+        return;
+    }
+#if defined(__gnu_linux__)
+    if (syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA)) {
+        fprintf(stderr, "AMX is not ready to be used!\n");
+        ggml_amx_initialized = false;
+    }
+    ggml_amx_initialized = true;
+#elif defined(_WIN32)
+    ggml_amx_initialized = true;
+#endif
+}
+#endif
+
 ////////////////////////////////////////////////////////////////////////////////
 
 void ggml_print_object(const struct ggml_object * obj) {
@@ -2733,6 +2763,10 @@ struct ggml_context * ggml_init(struct ggml_init_params params) {
 
 #if defined(GGML_USE_CLBLAST)
         ggml_cl_init();
+#endif
+
+#if defined(__AMX_INT8__)
+        ggml_amx_init();
 #endif
 
         ggml_setup_op_has_task_pass();
@@ -10708,6 +10742,39 @@ static bool ggml_compute_forward_mul_mat_use_blas(struct ggml_tensor * dst) {
 }
 #endif
 
+static bool ggml_compute_forward_mul_mat_use_amx(struct ggml_tensor * dst) {
+#if defined(__AMX_INT8__)
+    if (!ggml_amx_initialized) {
+        return false;
+    }
+
+    // load tile config
+    ggml_tile_config_init();
+
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    const enum ggml_type type = src0->type;
+    const int64_t ne0 = dst->ne[0];
+    const int64_t ne10 = src1->ne[0];
+
+
+    // TODO: double check ic = 2 * 16
+    // amx kernels enables for Q4_0
+    bool has_amx_kernels = (type == GGML_TYPE_Q4_0) ||
+        (type == GGML_TYPE_Q4_1);;
+    return dst->op != GGML_OP_MUL_MAT_ID &&
+        ggml_is_contiguous(src0) &&
+        ggml_is_contiguous(src1) &&
+        src1->type == GGML_TYPE_F32 &&
+        has_amx_kernels &&
+        // out features is 32x and in features is 64x
+        ne0 % (TILE_N * 2) == 0 && ne10 % TILE_K == 0;
+#else
+    return false;
+#endif
+}
+
 static void ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -10880,6 +10947,8 @@ UseGgmlGemm1:;
         return;
     }
 
+    const bool use_amx = ggml_compute_forward_mul_mat_use_amx(dst);
+
     const void * wdata    = (src1->type == vec_dot_type) ? src1->data : params->wdata;
     const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
@@ -10920,9 +10989,10 @@ UseGgmlGemm2:;
     const int64_t ith0 = ith % nth0;
     const int64_t ith1 = ith / nth0;
 
+
     // block-tiling attempt
-    const int64_t blck_0 = 16;
-    const int64_t blck_1 = 16;
+    const int64_t blck_0 = GGML_MUL_MAT_BLCK_SIZE;
+    const int64_t blck_1 = GGML_MUL_MAT_BLCK_SIZE;
 
     const int64_t nblck0 = (nr0 + blck_0 - 1)/blck_0;
     const int64_t nblck1 = (nr1 + blck_1 - 1)/blck_1;
@@ -10940,22 +11010,28 @@ UseGgmlGemm2:;
     assert(ne12 % ne02 == 0);
     assert(ne13 % ne03 == 0);
 
-    // dot kernels can handle 1 row and col at a time, but mmla kernels can process 2 rows and cols
+    // 1. dot kernels can handle 1 row and col at a time
+    // 2. mmla kernels can handle 2 rows and cols
+    // 3. amx kernels can handle 32 rows and cols
     int64_t nrc = vec_dot_num_rows;
     // TODO: currently the mmla kernels support only even numbered rows/cols.
     // this check can be removed once they are extended to support odd numbered rows/cols too
-    if ((nr0 % 2 != 0) || (ne11 % 2 != 0)) {
-        nrc = 1;
+    if (nrc == 2) {
+        if ((nr0 % 2 != 0) || (ne11 % 2 != 0)) { nrc = 1; }
+    }
+    if (nrc == 32) {
+        if (!use_amx) { nrc = 1; }
     }
 
     const size_t src1_col_stride = src1_cont || src1->type != vec_dot_type ? row_size : nb11;
 
     // attempt to reduce false-sharing (does not seem to make a difference)
     // 16 * 2, accounting for mmla kernels
-    float tmp[32];
+    //float tmp[32];
+    float * tmp = GGML_ALIGNED_MALLOC(GGML_MUL_MAT_BLCK_SIZE*nrc*sizeof(float));
 
     // strides for vec_dot
-    const size_t bs = nrc>1 ? 16 : 0;
+    const size_t bs = nrc>1 ? GGML_MUL_MAT_BLCK_SIZE : 0;
     const size_t bx = nrc>1 ? nb01 : 0;
     const size_t by = nrc>1 ? src1_col_stride : 0;
 
@@ -10990,16 +11066,19 @@ UseGgmlGemm2:;
                      : (i11*nb11 + i12*nb12 + i13*nb13));
                 float * dst_col = (float *) ((char *) dst->data + (i1*nb1 + i2*nb2 + i3*nb3));
 
+                // number of rows actually processed in vec_dot
+                const int64_t nrows = use_amx ? (ir11 - ir10) : nrc;
                 for (int64_t ir0 = ir00; ir0 < ir01; ir0 += nrc) {
-                    vec_dot(ne00, &tmp[ir0 - ir00], bs, src0_row + ir0*nb01, bx, src1_col, by, nrc);
+                    vec_dot(ne00, &tmp[ir0 - ir00], bs, src0_row + ir0*nb01, bx, src1_col, by, nrows);
                 }
 
-                for (int cn = 0; cn < nrc; ++cn) {
-                    memcpy(&dst_col[ir00 + cn*nb1/nb0], tmp + (cn*16), (ir01 - ir00)*sizeof(float));
+                for (int cn = 0; cn < nrows; ++cn) {
+                    memcpy(&dst_col[ir00 + cn*nb1/nb0], tmp + cn*bs, (ir01 - ir00)*sizeof(float));
                 }
             }
         }
     }
+    GGML_ALIGNED_FREE(tmp);
 }
 
 // ggml_compute_forward_mul_mat_id
